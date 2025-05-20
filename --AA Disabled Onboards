@@ -1,0 +1,105 @@
+SET start_date = TO_DATE('2024-05-01');
+
+CREATE OR REPLACE TEMPORARY TABLE status_changes AS (
+    SELECT 
+        driver_id,
+        driver_uuid,
+        orders_delivered_cumulative,
+        rider_admin_status_note,
+        CUR_ADMIN_STATUS,
+        DATE,
+        LAG(rider_admin_status_note) OVER (PARTITION BY driver_id ORDER BY DATE) as prev_note,
+        LAG(CUR_ADMIN_STATUS) OVER (PARTITION BY driver_id ORDER BY DATE) as prev_status,
+        ROW_NUMBER() OVER (PARTITION BY driver_id, rider_admin_status_note, CUR_ADMIN_STATUS ORDER BY DATE) as status_occurrence
+    FROM production.denormalised.driver_accounting_daily AS DAD 
+    WHERE dad.DATE >= $start_date AND CUR_COUNTRY IN ('Ireland', 'UK')
+);
+CREATE OR REPLACE TEMPORARY TABLE distinct_statuses AS (
+SELECT 
+    driver_id,
+    driver_uuid,
+    orders_delivered_cumulative,
+    rider_admin_status_note,
+    CUR_ADMIN_STATUS,
+    DATE
+FROM status_changes
+WHERE 
+    (rider_admin_status_note IS DISTINCT FROM prev_note)
+    OR (CUR_ADMIN_STATUS IS DISTINCT FROM prev_status)
+    OR prev_note IS NULL  -- Keep the first record for each driver
+    AND status_occurrence = 1  -- Only keep the first occurrence of each status
+);
+
+CREATE OR REPLACE TEMPORARY TABLE disabled_onboards AS (
+SELECT
+        LS.COUNTRY_NAME,
+        LS.onboarding_area,
+        LS.CITY,
+        --SUBSTR(LS.RIDER_DRN, 18) AS UUID,
+        DS.driver_id,
+        DS.orders_delivered_cumulative,
+        DS.rider_admin_status_note,
+        DS.CUR_ADMIN_STATUS,
+        DS.DATE AS status_date,
+        TO_DATE(CASE WHEN LS.LIFECYCLE_MAIN_STAGE = 'application' AND LS.STAGE_STATUS ILIKE '%completed%' THEN GREATEST(LS.EVENT_UPDATED_AT, LS.EVENT_CREATED_AT) END) AS onboarding_at_date, -- Use TO_DATE directly
+        TO_DATE(LS.CREATED_IN_RIDER_ADMIN_AT) AS created_in_rider_admin_at_date, -- Use TO_DATE directly
+        CURRENT_DATE - onboarding_at_date AS days_since_onboarding,
+        status_date - onboarding_at_date AS days_since_onboard_status_change,
+        LS.VEHICLE_TYPE
+
+    FROM "RIDERS"."RIDER_LIFECYCLE_LATEST_STATUS" AS LS
+    LEFT JOIN "RIDERS"."RIDER_LIFECYCLE_LATEST_ONBOARDING_PHASE" AS OP -- FOR 
+        ON (CASE WHEN 'yes' = 'yes' THEN LS.RIDER_DRN ELSE MD5(LS.RIDER_DRN) END) = (CASE WHEN 'yes' = 'yes' THEN OP.RIDER_DRN ELSE MD5(OP.RIDER_DRN) END)
+        AND LS.LIFECYCLE_MAIN_STAGE = OP.LIFECYCLE_STAGE
+    LEFT JOIN distinct_statuses AS DS ON DS.driver_uuid = SUBSTR(LS.RIDER_DRN, 18)
+    WHERE -- onboarded after start date but have had at least 5 weeks to activate, not subs or returner 
+        onboarding_at_date >= $start_date -- Filter using the variable
+        AND created_in_rider_admin_at_date >= $start_date -- Filter using the variable
+        AND LS.ONBOARDING_PLATFORM = 'salesforce'
+        AND LS.COUNTRY_NAME IN ('Ireland', 'UK')
+        AND is_substitute_account_on_admin = false
+        AND OP.is_returner = false
+
+    GROUP BY
+        created_in_rider_admin_at_date, -- Group by DATE type
+        onboarding_at_date, -- Group by DATE type
+        LS.COUNTRY_NAME,
+        LS.onboarding_area,
+        LS.CITY,
+        LS.rider_drn,
+        --UUID,
+        DS.driver_id,
+        DS.orders_delivered_cumulative,
+        DS.rider_admin_status_note,
+        DS.CUR_ADMIN_STATUS,
+        DS.DATE,
+        LS.VEHICLE_TYPE
+
+    ORDER BY driver_id, DATE
+
+);
+
+
+
+select * 
+from disabled_onboards
+WHERE days_since_onboarding >= 14
+order by onboarding_at_date desc
+;
+
+
+SELECT * 
+
+FROM disabled_onboards
+WHERE days_since_onboarding > 14
+     AND ONBOARDING_AT_DATE >= '2025-01-01'
+     AND CUR_ADMIN_STATUS = 'DISABLED'
+
+ORDER BY driver_id, status_date 
+;
+
+
+select count(distinct driver_id), rider_admin_status_note, CUR_ADMIN_STATUS
+from disabled_onboards
+group by 2,3
+order by 1 desc;

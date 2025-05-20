@@ -1,0 +1,21 @@
+SELECT
+
+--z.zone_code,z.cluster_name,z.city_name,
+c.city_detailed,
+SUM(z.orders_delivered) AS orders
+
+
+
+FROM production.reference.city_detailed c
+FULL JOIN production.AGGREGATE.AGG_ZONE_DELIVERY_METRICS_HOURLY z
+ON c.zone_code = z.zone_code
+
+WHERE z.country_name IN ('UK','Ireland')
+
+AND z.start_of_period_local BETWEEN '2024-05-06' AND '2024-05-26'
+
+
+AND z.zone_code <> 'LNTG'
+
+GROUP BY 1
+ORDER BY 2 DESC;

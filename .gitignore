@@ -1,0 +1,24 @@
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Temporary files
+*.tmp
+*.temp
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# SQL temporary files
+*_temp*
+*temp*
+*TEMP*
+
+# IDE specific files
+.vscode/
+.idea/ 
