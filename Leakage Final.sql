@@ -1,33 +1,42 @@
------ testing accurate onboarding city data -----
-
-
--- NEW LEAKAGE QUERY including near/far distance and city details within clusters, exluding subs
+-- Leakage / Activation query -- including near/far distance and onboarding areas within clusters, excluding subs
+-- copy output into A2
 --------------------------------------------------------------------------------------------------------------------------------------------------
 ----------------REFERENCES------------------------------------------------------------------------------------------------------------  
 -- ===========================================================================================================================================================
 -- 1.1 CITY PAIRS -------------------------------------------------------------------------------------------------------------------------
 -- ===========================================================================================================================================================
+
 CREATE OR REPLACE TEMPORARY TABLE CD_PAIRS1 AS (
 
         SELECT 
             DZMH.COUNTRY_NAME, 
             DZMH.CLUSTER_NAME, 
-            COALESCE(CD.CITY_DETAILED, CD.CITY_NAME) AS CITY_DETAILED
+            COALESCE(OA.ONBOARDING_AREA, OA.CITY_NAME) AS ONBOARDING_AREA
         FROM production.AGGREGATE.AGG_ZONE_DELIVERY_METRICS_HOURLY AS DZMH
-        LEFT JOIN production.reference.city_detailed AS CD ON DZMH.ZONE_CODE = CD.ZONE_CODE
+        LEFT JOIN scratch.riders.zone_drn_id_to_onboarding_area AS OA ON DZMH.ZONE_CODE = OA.ZONE_CODE
         WHERE DZMH.COUNTRY_NAME IN ('France', 'Italy', 'Belgium', 'UK', 'Ireland')
-            AND CITY_DETAILED IS NOT NULL
-        GROUP BY DZMH.COUNTRY_NAME, DZMH.CLUSTER_NAME, CD.CITY_DETAILED, CD.CITY_NAME
-        ORDER BY DZMH.COUNTRY_NAME DESC, DZMH.CLUSTER_NAME, CD.CITY_DETAILED
-        );
-        CREATE OR REPLACE TEMPORARY TABLE CD_PAIRS2 AS (
-        SELECT A.COUNTRY_NAME, A.CITY_DETAILED AS CITY1, B.CITY_DETAILED AS CITY2, A.CITY_DETAILED || ' - ' || B.CITY_DETAILED AS CLUSTER_PAIR
-        FROM CD_PAIRS1 AS A
-        LEFT JOIN CD_PAIRS1 AS B ON A.CLUSTER_NAME = B.CLUSTER_NAME
-        ORDER BY A.COUNTRY_NAME DESC, A.CITY_DETAILED, B.CITY_DETAILED
+            AND ONBOARDING_AREA IS NOT NULL
+        GROUP BY DZMH.COUNTRY_NAME, DZMH.CLUSTER_NAME, OA.ONBOARDING_AREA, OA.CITY_NAME
+        ORDER BY DZMH.COUNTRY_NAME DESC, DZMH.CLUSTER_NAME, OA.ONBOARDING_AREA
         );
 
-/* 
+CREATE OR REPLACE TEMPORARY TABLE CD_PAIRS2 AS (
+        SELECT A.COUNTRY_NAME, A.ONBOARDING_AREA AS CITY1, B.ONBOARDING_AREA AS CITY2, A.ONBOARDING_AREA || ' - ' || B.ONBOARDING_AREA AS CLUSTER_PAIR
+        FROM CD_PAIRS1 AS A
+        LEFT JOIN CD_PAIRS1 AS B ON A.CLUSTER_NAME = B.CLUSTER_NAME
+        ORDER BY A.COUNTRY_NAME DESC, A.ONBOARDING_AREA, B.ONBOARDING_AREA
+        );
+
+
+/*
+Select * 
+From scratch.riders.zone_drn_id_to_onboarding_area
+Where Country_name in ('UK','Ireland','France','Italy','Belgium') 
+ORDER BY country_name DESC, ONBOARDING_AREA;
+
+
+SELECT * FROM CD_PAIRS1 ORDER BY COUNTRY_NAME DESC, CITY1, CITY2;
+
 SELECT * FROM CD_PAIRS2 ORDER BY COUNTRY_NAME DESC, CITY1, CITY2;
 */
 
@@ -35,22 +44,25 @@ SELECT * FROM CD_PAIRS2 ORDER BY COUNTRY_NAME DESC, CITY1, CITY2;
 -- ===========================================================================================================================================================
 -- 1.2 CITY DISTANCES -------------------------------------------------------------------------------------------------------------------------
 -- ===========================================================================================================================================================
+
+
 CREATE OR REPLACE TEMPORARY TABLE CITY_DISTANCES AS (
         WITH city_list AS (
             SELECT
-                B.CITY_DETAILED,
+                B.ONBOARDING_AREA,
                 MEDIAN(CENTROID_GEO_LAT) AS GEO_LAT, 
                 MEDIAN(CENTROID_GEO_LONG) AS GEO_LONG
             FROM PRODUCTION.REFERENCE.ZONE_CITY_COUNTRY A 
-            LEFT JOIN reference.city_detailed B ON A.zone_code = B.ZONE_CODE
+            LEFT JOIN scratch.riders.zone_drn_id_to_onboarding_area B ON A.zone_code = B.ZONE_CODE
             WHERE A.COUNTRY_NAME IN ('France', 'Italy', 'Belgium', 'UK', 'Ireland')
-                AND B.CITY_DETAILED IS NOT NULL
-            GROUP BY B.city_detailed
+                AND B.ONBOARDING_AREA IS NOT NULL
+            GROUP BY B.ONBOARDING_AREA
+            ORDER BY B.ONBOARDING_AREA
         )
         SELECT 
-            A.CITY_DETAILED || B.CITY_DETAILED AS CITY_DETAILED_COMBO,
-            A.CITY_DETAILED AS CITY_DETAILED_1, 
-            B.CITY_DETAILED AS CITY_DETAILED_2, 
+            A.ONBOARDING_AREA || B.ONBOARDING_AREA AS CITY_DETAILED_COMBO,
+            A.ONBOARDING_AREA AS CITY_DETAILED_1, 
+            B.ONBOARDING_AREA AS CITY_DETAILED_2, 
             A.GEO_LAT AS CITY_DETAILED_1_LAT,
             A.GEO_LONG AS CITY_DETAILED_1_LONG,
             B.GEO_LAT AS CITY_DETAILED_2_LAT,
@@ -62,11 +74,12 @@ CREATE OR REPLACE TEMPORARY TABLE CITY_DISTANCES AS (
         FROM city_list A
         CROSS JOIN city_list B
         ORDER BY CITY_DETAILED_COMBO
-        );
+        )
 
-/* 
-SELECT * FROM CITY_DISTANCES WHERE CITY_DETAILED_1 = 'Paris' order by DISTANCE_KM;
-*/
+;
+ -- SELECT * FROM CITY_DISTANCES WHERE CITY_DETAILED_1 LIKE 'London%' and CITY_DETAILED_2 LIKE 'London%' order by CITY_DETAILED_1, CITY_DETAILED_2;
+
+
 CREATE OR REPLACE TEMPORARY TABLE CITY_DISTANCES_CITY_NAME AS (
         WITH city_list2 AS (
             SELECT
@@ -98,59 +111,137 @@ SELECT * FROM CITY_DISTANCES_CITY_NAME WHERE CITY_NAME_1 = 'Paris' ORDER BY DIST
 */ 
 
 
+
 --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 --------THE SF SIDE---------------------------------------------------------------------------------------------------------------------------------------------------
 -- ===========================================================================================================================================================
+-- 2.0 New_Onboarding_Area_Process -------------------------------------------------------------------------------------------------------------------------
+-- ===========================================================================================================================================================
+
+CREATE OR REPLACE TEMPORARY TABLE New_OA_Process AS  (
+        SELECT
+            onboarding_area,
+            driver_id,
+            TO_CHAR(
+                TO_DATE(
+                    CASE 
+                        WHEN LIFECYCLE_MAIN_STAGE = 'application' 
+                        AND STAGE_STATUS ILIKE '%completed%' 
+                        THEN greatest(EVENT_UPDATED_AT, EVENT_CREATED_AT)
+                    END), 'YYYY-MM-DD') AS onboarding_at_date
+            , CASE WHEN COUNTRY_NAME IN ('UK', 'Ireland') THEN 'UKI' ELSE COUNTRY_NAME END AS COUNTRY_GROUP
+
+        FROM RIDERS.RIDER_LIFECYCLE_LATEST_STATUS AS a
+        LEFT JOIN production.denormalised.driver_accounting_daily AS b 
+                            ON CAST(a.RIDER_UUID AS STRING) = CAST(b.DRIVER_UUID AS STRING)
+        WHERE 
+
+            TO_DATE(DATE_TRUNC('month', TO_DATE(
+                CASE 
+                    WHEN LIFECYCLE_MAIN_STAGE = 'application' 
+                    AND STAGE_STATUS ILIKE '%completed%' 
+                    THEN greatest(EVENT_UPDATED_AT, EVENT_CREATED_AT)
+                END))) >= '2023-11-01'
+            AND LIFECYCLE_MAIN_STAGE = 'application'
+            AND ONBOARDING_PLATFORM = 'salesforce'
+            AND COUNTRY_NAME IN ('Ireland', 'UK')
+            AND (NOT is_substitute_account_on_admin OR is_substitute_account_on_admin IS NULL)
+        GROUP BY 
+            onboarding_area,
+            RIDER_UUID,
+            TO_DATE(
+                CASE 
+                    WHEN LIFECYCLE_MAIN_STAGE = 'application' 
+                    AND STAGE_STATUS ILIKE '%completed%' 
+                    THEN greatest(EVENT_UPDATED_AT, EVENT_CREATED_AT)
+                END
+            ),
+            driver_id,
+            COUNTRY_GROUP
+        HAVING COUNT(DISTINCT CASE 
+            WHEN LIFECYCLE_MAIN_STAGE = 'application' 
+            AND STAGE_STATUS ILIKE '%completed%'
+            THEN RIDER_UUID 
+        END) >= 1
+        ORDER BY 
+            COUNTRY_GROUP desc, onboarding_area, 3, 2
+
+        )
+
+
+        ;
+
+
+
+-- ===========================================================================================================================================================
 -- 2.1 SF_OB_City -------------------------------------------------------------------------------------------------------------------------
 -- ===========================================================================================================================================================
-CREATE OR REPLACE TEMPORARY TABLE ONBOARDING_CITY AS(
-
-SELECT
-    onboarding_area,
-    RIDER_UUID,
-    TO_CHAR(
-        TO_DATE(
-            CASE 
-                WHEN LIFECYCLE_MAIN_STAGE = 'application' 
-                AND STAGE_STATUS ILIKE '%completed%' 
-                THEN greatest(EVENT_UPDATED_AT, EVENT_CREATED_AT)
-            END), 'YYYY-MM-DD') AS onboarding_at_date
-    , CASE WHEN COUNTRY_NAME IN ('UK', 'Ireland') THEN 'UKI' ELSE COUNTRY_NAME END AS COUNTRY_GROUP
-
-FROM RIDERS.RIDER_LIFECYCLE_LATEST_STATUS
-WHERE 
-
-    TO_DATE(DATE_TRUNC('month', onboarding_at_date)) >= '2023-11-01'
-    AND LIFECYCLE_MAIN_STAGE = 'application'
-    AND ONBOARDING_PLATFORM = 'salesforce'
-    AND COUNTRY_NAME IN ('Ireland', 'UK')
-    AND (NOT is_substitute_account_on_admin OR is_substitute_account_on_admin IS NULL)
-GROUP BY 
-    onboarding_area,
-    RIDER_UUID,
-    TO_DATE(
-        CASE 
-            WHEN LIFECYCLE_MAIN_STAGE = 'application' 
-            AND STAGE_STATUS ILIKE '%completed%' 
-            THEN greatest(EVENT_UPDATED_AT, EVENT_CREATED_AT)
-        END
-    ),
-    COUNTRY_GROUP
-HAVING COUNT(DISTINCT CASE 
-    WHEN LIFECYCLE_MAIN_STAGE = 'application' 
-    AND STAGE_STATUS ILIKE '%completed%'
-    THEN RIDER_UUID 
-END) >= 1
-ORDER BY 
-    onboarding_area, 3, 2
-    
-
-);
-
 
 CREATE OR REPLACE TEMPORARY TABLE SF_OB_City AS (
             SELECT
                 COUNTRY_GROUP,
+                approved_month,
+                COALESCE(CITY, onboarding_area) AS CITY,
+                driver_id,
+                RIDER_UUID,
+                activated_28D_OB_city,
+                activated_OB_city,
+                activated_1HOUR_OB_city,
+                ORDER_1_28D_OB_city,
+                ORDER_1_OB_city,
+                ORDER_20_28D_OB_city,
+                ORDER_20_OB_city,
+                CREATED_IN_RIDER_ADMIN_AT
+            FROM (
+                SELECT
+                    CASE WHEN a.COUNTRY_NAME IN ('UK', 'Ireland') THEN 'UKI' ELSE a.COUNTRY_NAME END AS COUNTRY_GROUP,
+                    TO_DATE(DATE_TRUNC('month', CREATED_IN_RIDER_ADMIN_AT)) AS approved_month,
+                    IFNULL(CASE WHEN b.FIRST_WORK_DATE <= DATEADD('day', 28, CREATED_IN_RIDER_ADMIN_AT) THEN 1 ELSE 0 END, 0) AS activated_28D_OB_city,
+                    IFNULL(CASE WHEN b.FIRST_WORK_DATE IS NOT NULL THEN 1 ELSE 0 END, 0) AS activated_OB_city,
+                    IFNULL(CASE WHEN b.HOURS_WORKED_CUMULATIVE >= 1 THEN 1 ELSE 0 END, 0) AS activated_1HOUR_OB_city,
+                    IFNULL(CASE WHEN b.FIRST_ORDER_DATE <= DATEADD('day', 28, CREATED_IN_RIDER_ADMIN_AT) THEN 1 ELSE 0 END, 0) AS ORDER_1_28D_OB_city,
+                    IFNULL(CASE WHEN b.FIRST_ORDER_DATE IS NOT NULL THEN 1 ELSE 0 END, 0) AS ORDER_1_OB_city,
+                    IFNULL(CASE WHEN b.FIRST_20_ORDERS_DATE <= DATEADD('day', 28, CREATED_IN_RIDER_ADMIN_AT) THEN 1 ELSE 0 END, 0) AS ORDER_20_28D_OB_city,
+                    IFNULL(CASE WHEN b.FIRST_20_ORDERS_DATE IS NOT NULL THEN 1 ELSE 0 END, 0) AS ORDER_20_OB_city,
+                    CREATED_IN_RIDER_ADMIN_AT, 
+                    a.onboarding_area AS CITY,
+                    c.onboarding_area, 
+                    case when a.onboarding_area = c.onboarding_area THEN 1 ELSE 0 END AS matches_ob_city,
+        
+                
+                    --coalesce(c.onboarding_area, a.onboarding_area) AS CITY,   --- updated
+
+                    b.driver_id, a.RIDER_UUID,
+                    ROW_NUMBER() OVER (PARTITION BY b.driver_id ORDER BY EVENT_UPDATED_AT ASC, a.onboarding_area) AS rn
+                FROM PRODUCTION.RIDERS.RIDER_LIFECYCLE_LATEST_STATUS AS a
+                LEFT JOIN production.denormalised.driver_accounting_daily AS b 
+                    ON CAST(a.RIDER_UUID AS STRING) = CAST(b.DRIVER_UUID AS STRING)
+                --LEFT JOIN scratch.riders.zone_drn_id_to_onboarding_area AS c ON c.city_detailed = a.onboarding_area
+                LEFT JOIN New_OA_Process AS c
+                    ON CAST(B.driver_id AS STRING) = CAST(c.driver_id AS STRING)
+
+
+                WHERE ONBOARDING_PLATFORM = 'salesforce'
+                AND LIFECYCLE_MAIN_STAGE = 'application'
+                AND IS_SUBSTITUTE_ACCOUNT_ON_ADMIN = 'FALSE'
+                AND a.COUNTRY_NAME IN ('France', 'Italy', 'Belgium', 'UK', 'Ireland')
+                AND IS_CREATED_ON_ADMIN = 'TRUE'
+                AND TO_DATE(DATE_TRUNC('month', CREATED_IN_RIDER_ADMIN_AT)) >= '2023-11-01'
+                AND DATE = (SELECT MAX(DATE) FROM production.denormalised.driver_accounting_daily)
+                --and city like 'London%' -- added to test
+                
+                -----
+                --AND ONBOARDING_AREA NOT IN (SELECT ONBOARDING_AREA FROM scratch.riders.zone_drn_id_to_onboarding_area)
+                
+            ) subquery
+            WHERE rn = 1 AND CITY IS NOT NULL
+            AND CITY IN (SELECT ONBOARDING_AREA FROM scratch.riders.zone_drn_id_to_onboarding_area)
+
+                
+        );    
+
+-- Onboarding Data by City & Month
+SELECT COUNTRY_GROUP,
                 approved_month,
                 activated_28D_OB_city,
                 activated_OB_city,
@@ -159,53 +250,39 @@ CREATE OR REPLACE TEMPORARY TABLE SF_OB_City AS (
                 ORDER_1_OB_city,
                 ORDER_20_28D_OB_city,
                 ORDER_20_OB_city,
-                onboarding_at_date,
+                CREATED_IN_RIDER_ADMIN_AT,
                 CITY,
+                B.onboarding_area,
                 driver_id
-            FROM (
-                SELECT
-                    COUNTRY_GROUP,
-                    TO_DATE(DATE_TRUNC('month', onboarding_at_date)) AS approved_month,
-                    IFNULL(CASE WHEN b.FIRST_WORK_DATE <= DATEADD('day', 28, onboarding_at_date) THEN 1 ELSE 0 END, 0) AS activated_28D_OB_city,
-                    IFNULL(CASE WHEN b.FIRST_WORK_DATE IS NOT NULL THEN 1 ELSE 0 END, 0) AS activated_OB_city,
-                    IFNULL(CASE WHEN b.HOURS_WORKED_CUMULATIVE >= 1 THEN 1 ELSE 0 END, 0) AS activated_1HOUR_OB_city,
-                    IFNULL(CASE WHEN b.FIRST_ORDER_DATE <= DATEADD('day', 28, onboarding_at_date) THEN 1 ELSE 0 END, 0) AS ORDER_1_28D_OB_city,
-                    IFNULL(CASE WHEN b.FIRST_ORDER_DATE IS NOT NULL THEN 1 ELSE 0 END, 0) AS ORDER_1_OB_city,
-                    IFNULL(CASE WHEN b.FIRST_20_ORDERS_DATE <= DATEADD('day', 28, onboarding_at_date) THEN 1 ELSE 0 END, 0) AS ORDER_20_28D_OB_city,
-                    IFNULL(CASE WHEN b.FIRST_20_ORDERS_DATE IS NOT NULL THEN 1 ELSE 0 END, 0) AS ORDER_20_OB_city,
-                    onboarding_at_date, a.CITY, b.driver_id,
-                    ROW_NUMBER() OVER (PARTITION BY b.driver_id ORDER BY EVENT_UPDATED_AT ASC, a.CITY) AS rn
-                FROM ONBOARDING_CITY AS a
-                LEFT JOIN production.denormalised.driver_accounting_daily AS b 
-                    ON CAST(a.RIDER_UUID AS STRING) = CAST(b.DRIVER_UUID AS STRING)
-                WHERE ONBOARDING_PLATFORM = 'salesforce'
-                AND LIFECYCLE_MAIN_STAGE = 'application'
-                AND IS_SUBSTITUTE_ACCOUNT_ON_ADMIN = 'FALSE'
-                AND a.COUNTRY_NAME IN ('France', 'Italy', 'Belgium', 'UK', 'Ireland')
-                AND IS_CREATED_ON_ADMIN = 'TRUE'
-                AND TO_DATE(DATE_TRUNC('month', onboarding_at_date)) >= '2023-11-01'
-                AND DATE = (SELECT MAX(DATE) FROM production.denormalised.driver_accounting_daily)
-            ) subquery
-            WHERE rn = 1
-        );    
+
+            FROM SF_OB_City AS A
+            LEFT JOIN scratch.riders.zone_drn_id_to_onboarding_area AS B ON B.city_name = A.CITY
+
+            WHERE approved_month = '2024-10-01' 
+                AND COUNTRY_GROUP = 'UKI' 
+
+            GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
+            ORDER BY 1 DESC, 2 DESC, CITY, driver_id 
+            ;
+            
 
 -- CREATE A SUM OF ONBOARDS FOR RIDERS.RIDER_LIFECYCLE_LATEST_STATUS WHERE IS WOKING? ETC
-SELECT DISTINCT A.CITY, B.CITY_DETAILED 
+/*SELECT DISTINCT A.CITY, B.CITY_DETAILED 
 
-FROM PRODUCTION.RIDERS.RIDER_LIFECYCLE_LATEST_STATUS AS A
-LEFT JOIN production.reference.city_detailed AS b ON A.CITY = b.CITY_DETAILED
+        FROM PRODUCTION.RIDERS.RIDER_LIFECYCLE_LATEST_STATUS AS A
+        LEFT JOIN production.reference.city_detailed AS b ON A.CITY = b.CITY_DETAILED
 
-WHERE A.COUNTRY_NAME = 'UK' 
-AND ONBOARDING_PLATFORM = 'salesforce'
-AND LIFECYCLE_MAIN_STAGE = 'application'
-AND IS_SUBSTITUTE_ACCOUNT_ON_ADMIN = 'FALSE'
-AND IS_CREATED_ON_ADMIN = 'TRUE'
-ORDER BY 1, 2
-;
-
+        WHERE A.COUNTRY_NAME = 'UK' 
+        AND ONBOARDING_PLATFORM = 'salesforce'
+        AND LIFECYCLE_MAIN_STAGE = 'application'
+        AND IS_SUBSTITUTE_ACCOUNT_ON_ADMIN = 'FALSE'
+        AND IS_CREATED_ON_ADMIN = 'TRUE'
+        ORDER BY 1, 2
+        ;
+*/
   
 /*  --Onboarding Data rider level
-SELECT * FROM SF_OB_city ORDER BY COUNTRY_GROUP DESC, CITY DESC;
+SELECT * FROM SF_OB_city  where approved_month < '2024-11-01'  ORDER BY COUNTRY_GROUP DESC, approved_month desc, CITY DESC, driver_id DESC;
  */
 -- ===========================================================================================================================================================
 -- 2.2 SF_count_ob_riders -------------------------------------------------------------------------------------------------------------------------
@@ -240,11 +317,11 @@ CREATE OR REPLACE TEMPORARY TABLE SF_cities_worked_in AS (
                 CREATED_IN_RIDER_ADMIN_AT,
                 a.driver_id,
                 a.city AS ob_city,
-                COALESCE(C.CITY_DETAILED, B.CITY_NAME) AS city_worked,
+                COALESCE(C.onboarding_area, B.CITY_NAME) AS city_worked,
                 ROUND(SUM(b.hrs_worked_raw),1) AS sum_hours_worked
             FROM SF_OB_City AS a 
             LEFT JOIN production.denormalised.driver_hours_worked AS b ON a.driver_id = b.driver_id
-            LEFT JOIN production.reference.city_detailed AS c ON b.zone_code = c.zone_code
+            LEFT JOIN scratch.riders.zone_drn_id_to_onboarding_area AS c ON b.zone_code = c.zone_code
             WHERE b.country_name IN ('France', 'Italy', 'Belgium', 'UK', 'Ireland')
                 AND TO_DATE(DATE_TRUNC('month', b.date)) >= '2023-11-01' 
             GROUP BY 1, 2, 3, 4, 5, 6
@@ -279,14 +356,41 @@ SELECT * FROM SF_cities_worked_in where DRIVER_ID = '866925' -- = 0  ORDER BY 1 
 -- RSC Past Month Rider Level Leakage
 */
 -- ===========================================================================================================================================================
+-- ===========================================================================================================================================================
 -- 2.2b SF_cities_worked_in ----- RSC Past Month Rider Level Leakage----------------------------------------------------------------------------------------------------------------------
 -- ===========================================================================================================================================================
-SELECT RIDER_ADMIN_CREATED_DATE, DRIVER_ID, ob_city, city_worked, sum_hours_worked, Matches_Near_or_Clustered, City_Detailed_Distance, City_Name_Distance
-FROM SF_cities_worked_in 
-where COUNTRY_GROUP = 'UKI' AND APPROVED_MONTH = '2024-10-01' 
-ORDER BY 3,4,2;
+-- ===========================================================================================================================================================
+-- ===========================================================================================================================================================
 
--- SELECT * FROM production.denormalised.driver_hours_worked LIMIT 5
+
+CREATE OR REPLACE TEMPORARY TABLE Leakage_Rider_City_Level AS (
+SELECT          A.COUNTRY_GROUP,
+                A.approved_month,
+                A.driver_id,
+                A.CITY AS ob_city,
+                B.city_worked,
+                B.sum_hours_worked,
+                B.Matches_Near_or_Clustered,
+                B.CITY_DETAILED_DISTANCE,
+                A.ORDER_1_28D_OB_city,
+                ROW_NUMBER() OVER (ORDER BY a.COUNTRY_GROUP DESC, a.approved_month DESC, A.driver_id DESC, B.sum_hours_worked DESC) as row_num
+
+            FROM SF_OB_City AS A
+            LEFT JOIN SF_cities_worked_in AS B ON A.driver_id = B.driver_id
+
+            WHERE A.APPROVED_MONTH >= DATEADD(month, -12, DATE_TRUNC('month', CURRENT_DATE()))
+            AND A.APPROVED_MONTH <= DATE_TRUNC('month', CURRENT_DATE())
+
+            GROUP BY 1,2,3,4,5,6,7,8,9
+            ORDER BY 1 DESC, 2 DESC, A.driver_id DESC, B.sum_hours_worked DESC
+;
+)
+
+SELECT * FROM Leakage_Rider_City_Level WHERE A.COUNTRY_GROUP = 'UKI';
+SELECT * FROM Leakage_Rider_City_Level WHERE A.COUNTRY_GROUP <> 'UKI';
+
+
+
 
 -- ===========================================================================================================================================================
 -- 2.3 SF_hours_split -------------------------------------------------------------------------------------------------------------------------
